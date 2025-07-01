@@ -380,12 +380,12 @@
           </div>
         {/if}
 
-        <!-- Debug/Test buttons (remove in production) -->
+        <!-- Debug/Test buttons (remove in production)
         <div class="debug-actions">
           <button class="debug-btn" onclick={handleLogout}>🔓 Déconnexion</button>
           <button class="debug-btn" onclick={clearAllUsers}>🗑️ Effacer tout</button>
           <button class="debug-btn" onclick={testNavigation}>🧪 Test Navigation</button>
-        </div>
+        </div> -->
       </div>
     </div>
   </div>
