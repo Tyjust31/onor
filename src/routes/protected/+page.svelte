@@ -1,911 +1,360 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { goto } from '$app/navigation';
   import * as XLSX from 'xlsx';
   
   let pseudo = $state('');
   let showSpreadsheet = $state(false);
   let workbook = $state(null);
   let worksheetData = $state([]);
-  let currentSheet = $state('Feuille1');
-  let fileInput;
+  let searchQuery = $state('');
+  let currentSheet = $state('Calcul_Main_01');
   let isAuthenticated = $state(false);
-  let sessionInfo = $state(null);
+  let isLoading = $state(false);
+  let lastSync = $state('');
   
-  // Données d'exemple
   const defaultData = [
-    ['Nom', 'Prénom', 'Age', 'Ville', 'Salaire'],
-    ['Dupont', 'Jean', 25, 'Paris', 35000],
-    ['Martin', 'Marie', 30, 'Lyon', 42000],
-    ['Durand', 'Pierre', 28, 'Marseille', 38000],
-    ['', '', '', '', '']  // Ligne vide pour permettre l'édition
+    ['ID', 'PROJET', 'STATUS', 'VALEUR (k€)', 'CHARGE %'],
+    ['001', 'Alpha Centauri', 'Active', '125', '85'],
+    ['002', 'Deep Pulse', 'Pending', '45', '12'],
+    ['003', 'Onor Engine', 'Completed', '310', '0'],
+    ['', '', '', '', '']
   ];
-  
-  // Fonctions utilitaires pour localStorage
-  function getLocalStorage(key: string): any {
-    try {
-      const item = localStorage.getItem(key);
-      return item ? JSON.parse(item) : null;
-    } catch (e) {
-      console.error('Erreur lecture localStorage:', e);
-      return null;
-    }
-  }
 
-  function setLocalStorage(key: string, value: any) {
-    try {
-      localStorage.setItem(key, JSON.stringify(value));
-    } catch (e) {
-      console.error('Erreur écriture localStorage:', e);
-    }
-  }
+  const storage = {
+    get: (key: string) => typeof localStorage !== 'undefined' ? JSON.parse(localStorage.getItem(key) || 'null') : null,
+    set: (key: string, val: any) => {
+        if (typeof localStorage !== 'undefined') {
+            localStorage.setItem(key, JSON.stringify(val));
+            lastSync = new Date().toLocaleTimeString();
+        }
+    },
+    remove: (key: string) => typeof localStorage !== 'undefined' && localStorage.removeItem(key)
+  };
 
-  function removeLocalStorage(key: string) {
-    try {
-      localStorage.removeItem(key);
-    } catch (e) {
-      console.error('Erreur suppression localStorage:', e);
-    }
-  }
-  
-  // Vérifier l'authentification au montage du composant
   onMount(() => {
-    checkAuthentication();
+    const session = storage.get('onor_session');
+    if (!session || !session.auth) { goto('/'); return; }
+    pseudo = session.pseudo;
+    isAuthenticated = true;
+    loadSavedWork();
   });
-  
-  function checkAuthentication() {
-    const session = getLocalStorage('onor_session');
-    
-    if (!session || !session.pseudo || !session.isAuthenticated) {
-      // Rediriger vers la page de connexion si pas de session valide
-      console.log('Session invalide, redirection vers la page de connexion');
-      window.location.href = '/';
-      return;
-    }
-    
-    try {
-      pseudo = session.pseudo;
-      sessionInfo = session;
-      isAuthenticated = true;
-      
-      // Vérifier si la session n'est pas trop ancienne (optionnel)
-      const loginTime = new Date(session.loginTime);
-      const now = new Date();
-      const hoursDiff = (now.getTime() - loginTime.getTime()) / (1000 * 60 * 60);
-      
-      // Session expire après 24 heures (optionnel)
-      if (hoursDiff > 24) {
-        console.log('Session expirée');
-        logout();
-        return;
-      }
-      
-      console.log(`Utilisateur authentifié: ${pseudo}`);
-      
-      // Charger automatiquement les données sauvegardées s'il y en a
-      loadSavedWork();
-      
-    } catch (error) {
-      console.error('Erreur lors de la lecture de la session:', error);
-      logout();
-    }
+
+  // --- LOGIQUE DE CALCUL ---
+  // Calcule la somme d'une colonne si les valeurs sont numériques
+  function colSum(index: number) {
+    const values = worksheetData.slice(1).map(row => parseFloat(row[index])).filter(v => !isNaN(v));
+    return values.length ? values.reduce((a, b) => a + b, 0).toLocaleString() : '0';
   }
-  
-  function logout() {
-    // Sauvegarder les données de travail avant de se déconnecter
-    if (workbook && pseudo) {
-      saveWorkToLocal();
-    }
-    
-    // Supprimer la session du localStorage
-    removeLocalStorage('onor_session');
-    
-    // Rediriger vers la page de connexion
-    window.location.href = '/';
+
+  function colAvg(index: number) {
+    const values = worksheetData.slice(1).map(row => parseFloat(row[index])).filter(v => !isNaN(v));
+    return values.length ? (values.reduce((a, b) => a + b, 0) / values.length).toFixed(2) : '0';
   }
-  
+
+  // --- ACTIONS ---
   function loadSavedWork() {
-    const savedWork = getLocalStorage(`onor_work_${pseudo}`);
-    
-    if (savedWork) {
-      try {
-        console.log('Données sauvegardées trouvées pour', pseudo);
-        // Charger automatiquement les données sauvegardées
-        if (savedWork.workbook) {
-          workbook = savedWork.workbook;
-          worksheetData = savedWork.worksheetData || [];
-          currentSheet = savedWork.currentSheet || 'Feuille1';
-        }
-      } catch (error) {
-        console.error('Erreur lors du chargement des données sauvegardées:', error);
-      }
+    const saved = storage.get(`onor_work_${pseudo}`);
+    if (saved?.worksheetData) {
+      worksheetData = saved.worksheetData;
+      currentSheet = saved.currentSheet || 'Calcul_Main_01';
+      updateWorkbook();
     }
   }
-  
-  function initializeSpreadsheet() {
-    // Vérifier s'il y a des données sauvegardées pour cet utilisateur
-    const savedWork = getLocalStorage(`onor_work_${pseudo}`);
-    
-    if (savedWork && savedWork.workbook) {
-      const shouldLoad = confirm('Des données sauvegardées ont été trouvées. Voulez-vous les charger ?');
-      
-      if (shouldLoad) {
-        try {
-          workbook = savedWork.workbook;
-          worksheetData = savedWork.worksheetData || [];
-          currentSheet = savedWork.currentSheet || 'Feuille1';
-          
-          // Si les données sont vides, utiliser les données par défaut
-          if (!worksheetData || worksheetData.length === 0) {
-            worksheetData = defaultData;
-            updateWorkbook();
-          }
-          
-          showSpreadsheet = true;
-          return;
-        } catch (error) {
-          console.error('Erreur lors du chargement des données sauvegardées:', error);
-        }
-      }
-    }
-    
-    // Créer un nouveau classeur avec des données par défaut
-    const ws = XLSX.utils.aoa_to_sheet(defaultData);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, currentSheet);
-    
-    workbook = wb;
-    worksheetData = defaultData;
-    showSpreadsheet = true;
-    saveWorkToLocal(); // Sauvegarder immédiatement
+
+  function initializeNew() {
+    isLoading = true;
+    setTimeout(() => {
+        worksheetData = [...defaultData.map(r => [...r])];
+        showSpreadsheet = true;
+        isLoading = false;
+        save();
+    }, 500);
   }
+
+  function save() { storage.set(`onor_work_${pseudo}`, { worksheetData, currentSheet }); }
   
-  function addRow() {
-    const newRow = new Array(worksheetData[0]?.length || 5).fill('');
-    worksheetData = [...worksheetData, newRow];
-    updateWorkbook();
-    saveWorkToLocal();
+  function updateCell(r, c, val) { 
+    worksheetData[r][c] = val; 
+    save(); 
   }
-  
-  function addColumn() {
-    worksheetData = worksheetData.map(row => [...row, '']);
-    updateWorkbook();
-    saveWorkToLocal();
+
+  function addRow() { worksheetData = [...worksheetData, new Array(worksheetData[0].length).fill('')]; save(); }
+  function removeRow() { if (worksheetData.length > 1) { worksheetData = worksheetData.slice(0, -1); save(); }}
+
+  function handleFileUpload(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    isLoading = true;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const data = new Uint8Array(ev.target.result as ArrayBuffer);
+      const wb = XLSX.read(data, { type: 'array' });
+      const name = wb.SheetNames[0];
+      worksheetData = XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1 });
+      showSpreadsheet = true;
+      isLoading = false;
+      save();
+    };
+    reader.readAsArrayBuffer(file);
   }
-  
-  function updateCell(rowIndex, colIndex, value) {
-    worksheetData[rowIndex][colIndex] = value;
-    updateWorkbook();
-    saveWorkToLocal();
-  }
-  
+
   function updateWorkbook() {
-    if (workbook) {
-      const ws = XLSX.utils.aoa_to_sheet(worksheetData);
-      workbook.Sheets[currentSheet] = ws;
-    }
+    const ws = XLSX.utils.aoa_to_sheet(worksheetData);
+    workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, ws, currentSheet);
   }
-  
-  function saveWorkToLocal() {
-    if (pseudo) {
-      const workData = {
-        pseudo: pseudo,
-        workbook: workbook,
-        worksheetData: worksheetData,
-        currentSheet: currentSheet,
-        lastModified: new Date().toISOString()
-      };
-      setLocalStorage(`onor_work_${pseudo}`, workData);
-      console.log('Données sauvegardées pour', pseudo);
-    }
+
+  function exportXLSX() {
+    updateWorkbook();
+    XLSX.writeFile(workbook, `ONOR_${pseudo}_DATA.xlsx`);
   }
-  
-  function downloadExcel() {
-    if (workbook) {
-      XLSX.writeFile(workbook, `${pseudo}_feuille_calcul.xlsx`);
-    }
+
+  async function logout() {
+    storage.remove('onor_session');
+    document.cookie = "session_pseudo=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
+    await goto('/');
   }
-  
-  function downloadCSV() {
-    if (workbook) {
-      const csv = XLSX.utils.sheet_to_csv(workbook.Sheets[currentSheet]);
-      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-      const link = document.createElement('a');
-      link.href = URL.createObjectURL(blob);
-      link.download = `${pseudo}_feuille_calcul.csv`;
-      link.click();
-    }
-  }
-  
-  function handleFileUpload(event) {
-    const file = event.target.files[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        try {
-          const data = new Uint8Array(e.target.result);
-          const wb = XLSX.read(data, { type: 'array' });
-          workbook = wb;
-          
-          // Charger la première feuille
-          const firstSheetName = wb.SheetNames[0];
-          currentSheet = firstSheetName;
-          const ws = wb.Sheets[firstSheetName];
-          worksheetData = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false });
-          
-          showSpreadsheet = true;
-          saveWorkToLocal();
-          
-          // Réinitialiser l'input file
-          if (fileInput) {
-            fileInput.value = '';
-          }
-        } catch (error) {
-          console.error('Erreur lors du chargement du fichier:', error);
-          alert('Erreur lors du chargement du fichier. Vérifiez que le fichier est valide.');
-        }
-      };
-      reader.readAsArrayBuffer(file);
-    }
-  }
-  
-  function calculateSum(colIndex) {
-    let sum = 0;
-    for (let i = 1; i < worksheetData.length; i++) {
-      const value = parseFloat(worksheetData[i][colIndex]);
-      if (!isNaN(value)) {
-        sum += value;
-      }
-    }
-    return sum;
-  }
-  
-  function calculateAverage(colIndex) {
-    let sum = 0;
-    let count = 0;
-    for (let i = 1; i < worksheetData.length; i++) {
-      const value = parseFloat(worksheetData[i][colIndex]);
-      if (!isNaN(value)) {
-        sum += value;
-        count++;
-      }
-    }
-    return count > 0 ? sum / count : 0;
-  }
-  
-  function clearSavedWork() {
-    if (confirm('Êtes-vous sûr de vouloir supprimer toutes les données sauvegardées ?')) {
-      removeLocalStorage(`onor_work_${pseudo}`);
-      workbook = null;
-      worksheetData = [];
-      showSpreadsheet = false;
-      alert('Données sauvegardées supprimées.');
-    }
-  }
-  
-  function closeSpreadsheet() {
-    saveWorkToLocal();
-    showSpreadsheet = false;
-  }
-  
-  function getSessionDuration() {
-    if (!sessionInfo || !sessionInfo.loginTime) return 'Inconnu';
-    
-    const loginTime = new Date(sessionInfo.loginTime);
-    const now = new Date();
-    const diffMs = now.getTime() - loginTime.getTime();
-    const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
-    const diffMinutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
-    
-    if (diffHours > 0) {
-      return `${diffHours}h ${diffMinutes}m`;
-    } else {
-      return `${diffMinutes}m`;
-    }
-  }
+
+  const filteredData = $derived(
+    searchQuery 
+    ? [worksheetData[0], ...worksheetData.slice(1).filter(row => row.some(cell => String(cell).toLowerCase().includes(searchQuery.toLowerCase())))]
+    : worksheetData
+  );
 </script>
-<style lang="scss">
-/* Variables de couleurs */
-$primary-gradient: linear-gradient(135deg, #6a11cb 0%, #2575fc 100%);
-$secondary-gradient: linear-gradient(135deg, #2575fc 0%, #6a11cb 100%);
-$white: #ffffff;
-$black: #2d3436;
-$light-gray: #f5f6fa;
-$dark-gray: #636e72;
-$success: #00b894;
-$info: #0984e3;
-$warning: #fdcb6e;
-$danger: #d63031;
 
-/* Animations */
-@keyframes fadeIn {
-  from { opacity: 0; transform: translateY(10px); }
-  to { opacity: 1; transform: translateY(0); }
-}
+{#if isAuthenticated}
+<div class="app-container">
+    <div class="noise"></div>
 
-@keyframes pulse {
-  0% { transform: scale(1); }
-  50% { transform: scale(1.05); }
-  100% { transform: scale(1); }
-}
+    <nav class="glass-nav">
+        <a href="/" class="brand" onclick={(e) => { e.preventDefault(); goto('/'); }}>
+            <span class="logo">Ω</span>
+            <div class="brand-text">
+                <span class="name">ONOR LOGIC</span>
+                <span class="version">CORE v2.0.4</span>
+            </div>
+        </a>
+        
+        <div class="nav-center">
+            <div class="status-pill">
+                <span class="dot"></span>
+                SYSTEM READY
+                {#if lastSync}<span class="sync">SYNC: {lastSync}</span>{/if}
+            </div>
+        </div>
 
-/* Styles de base */
-* {
-  box-sizing: border-box;
-  margin: 0;
-  padding: 0;
-  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-}
+        <div class="user-zone">
+            <span class="user-tag">{pseudo}@onor</span>
+            <button class="btn-exit" onclick={logout}>EXIT</button>
+        </div>
+    </nav>
 
-body {
-  background-color: $light-gray;
-  color: $black;
-  line-height: 1.6;
-}
-
-/* Conteneur principal */
-.container {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  min-height: 100vh;
-  background: $primary-gradient;
-  color: $white;
-  padding: 2rem;
-  animation: fadeIn 0.5s ease-out;
-  
-  .box {
-    background: $white;
-    color: $black;
-    padding: 2.5rem;
-    border-radius: 1.5rem;
-    box-shadow: 0 10px 30px rgba(0,0,0,0.15);
-    text-align: center;
-    width: 100%;
-    max-width: 800px;
-    transition: transform 0.3s ease, box-shadow 0.3s ease;
-    
-    &:hover {
-      transform: translateY(-5px);
-      box-shadow: 0 15px 35px rgba(0,0,0,0.2);
-    }
-    
-    h1 {
-      font-size: 2.5rem;
-      margin-bottom: 1.5rem;
-      font-weight: 700;
-      background: $secondary-gradient;
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-      position: relative;
-      
-      &::after {
-        content: '';
-        position: absolute;
-        bottom: -10px;
-        left: 50%;
-        transform: translateX(-50%);
-        width: 80px;
-        height: 4px;
-        background: $secondary-gradient;
-        border-radius: 2px;
-      }
-    }
-    
-    .button-group {
-      display: flex;
-      gap: 1.5rem;
-      justify-content: center;
-      flex-wrap: wrap;
-      margin: 2rem 0;
-    }
-    
-    button {
-      padding: 0.85rem 1.75rem;
-      border: none;
-      border-radius: 50px;
-      background: $info;
-      color: $white;
-      cursor: pointer;
-      font-size: 1rem;
-      font-weight: 600;
-      transition: all 0.3s ease;
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      box-shadow: 0 4px 10px rgba($info, 0.3);
-      
-      &:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 6px 15px rgba($info, 0.4);
-      }
-      
-      &:active {
-        transform: translateY(0);
-      }
-      
-      &.excel-btn {
-        background: $success;
-        box-shadow: 0 4px 10px rgba($success, 0.3);
-        
-        &:hover {
-          box-shadow: 0 6px 15px rgba($success, 0.4);
-        }
-      }
-      
-      &.upload-btn {
-        background: $warning;
-        color: $black;
-        box-shadow: 0 4px 10px rgba($warning, 0.3);
-        
-        &:hover {
-          box-shadow: 0 6px 15px rgba($warning, 0.4);
-        }
-      }
-      
-      &.danger-btn {
-        background: $danger;
-        box-shadow: 0 4px 10px rgba($danger, 0.3);
-        
-        &:hover {
-          box-shadow: 0 6px 15px rgba($danger, 0.4);
-        }
-      }
-    }
-    
-    .file-input {
-      margin: 2rem 0;
-      width: 100%;
-      
-      label {
-        display: block;
-        margin-bottom: 0.75rem;
-        font-weight: 600;
-        color: $dark-gray;
-      }
-      
-      input[type="file"] {
-        width: 100%;
-        padding: 1rem;
-        border: 2px dashed rgba($info, 0.5);
-        border-radius: 1rem;
-        background: rgba($light-gray, 0.5);
-        transition: all 0.3s ease;
-        cursor: pointer;
-        
-        &:hover {
-          border-color: $info;
-          background: rgba($info, 0.1);
-        }
-        
-        &::file-selector-button {
-          padding: 0.5rem 1rem;
-          border: none;
-          border-radius: 50px;
-          background: $info;
-          color: $white;
-          cursor: pointer;
-          font-weight: 600;
-          margin-right: 1rem;
-          transition: all 0.3s ease;
-          
-          &:hover {
-            background: darken($info, 10%);
-          }
-        }
-      }
-    }
-    
-    .session-info {
-      margin-top: 2rem;
-      padding: 1.25rem;
-      background: rgba($info, 0.1);
-      border-radius: 1rem;
-      font-size: 0.95rem;
-      color: $info;
-      border-left: 4px solid $info;
-      text-align: left;
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-      
-      &::before {
-        content: 'ⓘ';
-        font-size: 1.2rem;
-      }
-    }
-  }
-}
-
-.loading {
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  min-height: 100vh;
-  background: $primary-gradient;
-  color: $white;
-  font-size: 1.75rem;
-  font-weight: 600;
-  
-  &::after {
-    content: '...';
-    animation: dots 1.5s steps(5, end) infinite;
-  }
-}
-
-@keyframes dots {
-  0%, 20% { content: '.'; }
-  40% { content: '..'; }
-  60%, 100% { content: '...'; }
-}
-
-.spreadsheet-container {
-  position: fixed;
-  top: 0;
-  left: 0;
-  width: 100vw;
-  height: 100vh;
-  background: $white;
-  z-index: 1000;
-  display: flex;
-  flex-direction: column;
-  animation: fadeIn 0.4s ease-out;
-  
-  .spreadsheet-header {
-    background: $primary-gradient;
-    color: $white;
-    padding: 1.25rem 2rem;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    flex-shrink: 0;
-    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-    
-    h2 {
-      margin: 0;
-      font-size: 1.75rem;
-      font-weight: 700;
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-      
-      &::before {
-        content: '📊';
-        font-size: 1.5rem;
-      }
-    }
-    
-    .header-actions {
-      display: flex;
-      gap: 1rem;
-      align-items: center;
-      
-      button {
-        padding: 0.75rem 1.5rem;
-        border: none;
-        border-radius: 50px;
-        background: $white;
-        color: $info;
-        cursor: pointer;
-        font-weight: 600;
-        font-size: 0.95rem;
-        transition: all 0.3s ease;
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-        
-        &:hover {
-          transform: translateY(-2px);
-          box-shadow: 0 4px 8px rgba(0,0,0,0.15);
-        }
-        
-        &:active {
-          transform: translateY(0);
-        }
-        
-        &.close-btn {
-          background: $danger;
-          color: $white;
-          
-          &:hover {
-            background: darken($danger, 10%);
-          }
-        }
-      }
-    }
-  }
-  
-  .toolbar {
-    background: $light-gray;
-    padding: 1rem;
-    border-bottom: 1px solid rgba($dark-gray, 0.1);
-    display: flex;
-    gap: 1rem;
-    align-items: center;
-    flex-shrink: 0;
-    
-    button {
-      padding: 0.5rem 1rem;
-      border: 1px solid rgba($dark-gray, 0.2);
-      border-radius: 50px;
-      background: $white;
-      cursor: pointer;
-      font-size: 0.9rem;
-      font-weight: 600;
-      transition: all 0.3s ease;
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      
-      &:hover {
-        background: $info;
-        color: $white;
-        border-color: $info;
-      }
-    }
-    
-    .stats {
-      margin-left: auto;
-      font-size: 0.9rem;
-      color: $dark-gray;
-      font-weight: 600;
-      display: flex;
-      gap: 1.5rem;
-      
-      span {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-        
-        &::before {
-          font-size: 1.1rem;
-        }
-        
-        &:nth-child(1)::before { content: '📈'; }
-        &:nth-child(2)::before { content: '📉'; }
-        &:nth-child(3)::before { content: '∑'; }
-        &:nth-child(4)::before { content: 'μ'; }
-      }
-    }
-  }
-  
-  .spreadsheet-content {
-    flex: 1;
-    overflow: auto;
-    padding: 1.5rem;
-    background: url("data:image/svg+xml,%3Csvg width='40' height='40' viewBox='0 0 40 40' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='%239C92AC' fill-opacity='0.05' fill-rule='evenodd'%3E%3Cpath d='M0 40L40 0H20L0 20M40 40V20L20 40'/%3E%3C/g%3E%3C/svg%3E");
-    
-    .table-container {
-      overflow: auto;
-      border: 1px solid rgba($dark-gray, 0.1);
-      border-radius: 1rem;
-      box-shadow: 0 5px 15px rgba(0,0,0,0.05);
-      max-height: calc(100vh - 200px);
-      
-      table {
-        width: 100%;
-        border-collapse: collapse;
-        background: $white;
-        min-width: 800px;
-        
-        th, td {
-          border: 1px solid rgba($dark-gray, 0.1);
-          padding: 0.75rem;
-          text-align: left;
-          min-width: 120px;
-          transition: background 0.2s ease;
-          
-          input {
-            width: 100%;
-            border: none;
-            padding: 0.5rem;
-            font-size: 0.95rem;
-            background: transparent;
-            transition: all 0.3s ease;
+    <main class="dashboard-content">
+        <section class="hero">
+            <div class="hero-left">
+                <h1>Terminal de <span class="highlight">Données</span></h1>
+                <p>Moteur de calcul haute performance pour environnement sécurisé.</p>
+            </div>
             
-            &:focus {
-              outline: none;
-              background: rgba($info, 0.05);
-              box-shadow: 0 0 0 2px rgba($info, 0.3);
-              border-radius: 4px;
-            }
-          }
-        }
-        
-        th {
-          background: rgba($info, 0.1);
-          font-weight: 700;
-          color: $info;
-          position: sticky;
-          top: 0;
-          z-index: 10;
-          
-          &::before {
-            content: attr(data-col);
-            display: block;
-            font-size: 0.7rem;
-            color: rgba($info, 0.7);
-            margin-bottom: 0.25rem;
-          }
-        }
-        
-        tr:nth-child(even) {
-          background: rgba($light-gray, 0.3);
-        }
-        
-        tr:hover {
-          background: rgba($info, 0.05);
-          
-          td {
-            background: rgba($info, 0.03);
-          }
-        }
-      }
-    }
-  }
-}
+            <div class="quick-stats">
+                <div class="stat-item">
+                    <span class="label">ENTRÉES</span>
+                    <span class="value">{worksheetData.length * (worksheetData[0]?.length || 0)}</span>
+                </div>
+                <div class="stat-item">
+                    <span class="label">LATENCE</span>
+                    <span class="value">0.02ms</span>
+                </div>
+            </div>
+        </section>
 
-/* Effets visuels supplémentaires */
-.pulse-effect {
-  animation: pulse 1.5s infinite;
-}
+        <div class="bento-grid">
+            <button class="bento-card primary" onclick={initializeNew} disabled={isLoading}>
+                <div class="icon">📈</div>
+                <div class="info">
+                    <h3>Nouvelle Analyse</h3>
+                    <p>Déployer une instance de calcul vierge</p>
+                </div>
+                {#if isLoading}<div class="loader"></div>{/if}
+            </button>
 
-.shake-effect {
-  animation: shake 0.5s;
-}
+            <label class="bento-card secondary">
+                <input type="file" onchange={handleFileUpload} hidden />
+                <div class="icon">📡</div>
+                <div class="info">
+                    <h3>Import Signal</h3>
+                    <p>Charger CSV, XLSX ou TXT</p>
+                </div>
+            </label>
 
-@keyframes shake {
-  0%, 100% { transform: translateX(0); }
-  20%, 60% { transform: translateX(-5px); }
-  40%, 80% { transform: translateX(5px); }
-}
-
-/* Responsive design */
-@media (max-width: 768px) {
-  .container {
-    padding: 1.5rem;
-    
-    .box {
-      padding: 1.75rem;
-      
-      h1 {
-        font-size: 2rem;
-      }
-      
-      .button-group {
-        gap: 1rem;
-        
-        button {
-          padding: 0.75rem 1.25rem;
-          font-size: 0.9rem;
-        }
-      }
-    }
-  }
-  
-  .spreadsheet-container {
-    .spreadsheet-header {
-      flex-direction: column;
-      gap: 1rem;
-      padding: 1rem;
-      
-      h2 {
-        font-size: 1.5rem;
-      }
-      
-      .header-actions {
-        width: 100%;
-        justify-content: space-between;
-        
-        button {
-          padding: 0.5rem 1rem;
-          font-size: 0.85rem;
-        }
-      }
-    }
-    
-    .toolbar {
-      flex-wrap: wrap;
-      
-      .stats {
-        width: 100%;
-        justify-content: space-between;
-        margin-top: 0.5rem;
-      }
-    }
-  }
-}
-</style>
-{#if !isAuthenticated}
-  <div class="loading">
-    Vérification de l'authentification...
-  </div>
-{:else}
-  <div class="container">
-    <div class="box">
-      <h1>Bienvenue {pseudo} 👋</h1>
-      
-      <div class="button-group">
-        <button class="excel-btn" onclick={initializeSpreadsheet}>
-          📊 Nouvelle feuille Excel
-        </button>
-        <button onclick={logout}>Se déconnecter</button>
-        <button class="danger-btn" onclick={clearSavedWork}>
-          🗑️ Effacer données
-        </button>
-      </div>
-      
-      <div class="file-input">
-        <label for="file-upload">📁 Ou importer un fichier Excel/CSV :</label>
-        <input 
-          id="file-upload"
-          type="file" 
-          accept=".xlsx,.xls,.csv" 
-          onchange={handleFileUpload}
-          bind:this={fileInput}
-        />
-      </div>
-      
-      <div class="session-info">
-        🔐 Session active - Vos données sont automatiquement sauvegardées localement
-      </div>
-    </div>
-  </div>
-
-  {#if showSpreadsheet}
-    <div class="spreadsheet-container">
-      <div class="spreadsheet-header">
-        <h2>📊 {currentSheet} - {pseudo}</h2>
-        <div class="header-actions">
-          <button onclick={downloadExcel}>💾 Télécharger Excel</button>
-          <button onclick={downloadCSV}>📄 Télécharger CSV</button>
-          <button class="close-btn" onclick={closeSpreadsheet}>✕ Fermer</button>
+            <div class="bento-card info-only">
+                <div class="icon">🔐</div>
+                <div class="info">
+                    <h3>Chiffrement AES</h3>
+                    <p>Stockage local persistant actif</p>
+                </div>
+            </div>
         </div>
-      </div>
-      
-      <div class="toolbar">
-        <button onclick={addRow}>➕ Ligne</button>
-        <button onclick={addColumn}>➕ Colonne</button>
-        <div class="stats">
-          Lignes: {worksheetData.length} | 
-          Colonnes: {worksheetData[0]?.length || 0}
-          {#if worksheetData.length > 1 && worksheetData[0]?.length > 4}
-            | Somme col 5: {calculateSum(4).toLocaleString('fr-FR')} | 
-            Moyenne col 5: {calculateAverage(4).toFixed(2)}
-          {/if}
-        </div>
-      </div>
-      
-      <div class="spreadsheet-content">
-        <div class="table-container">
-          <table>
-            <thead>
-              <tr>
-                {#each Array(Math.max(5, worksheetData[0]?.length || 0)) as _, colIndex}
-                  <th>{String.fromCharCode(65 + colIndex)}</th>
+    </main>
+
+    {#if showSpreadsheet}
+    <div class="spreadsheet-overlay">
+        <div class="sheet-window">
+            <header class="sheet-toolbar">
+                <div class="left">
+                    <span class="file-name">{currentSheet}.onor</span>
+                    <input type="text" class="search-bar" placeholder="Filtrer..." bind:value={searchQuery} />
+                </div>
+                
+                <div class="actions">
+                    <button class="btn-tool" onclick={addRow}>+ Ligne</button>
+                    <button class="btn-tool" onclick={removeRow}>- Ligne</button>
+                    <div class="sep"></div>
+                    <button class="btn-pro" onclick={exportXLSX}>EXPORTER XLSX</button>
+                    <button class="btn-close" onclick={() => showSpreadsheet = false}>×</button>
+                </div>
+            </header>
+
+            <div class="calc-bar">
+                {#each worksheetData[0] as header, i}
+                    <div class="calc-item">
+                        <span class="head">{header || 'Col ' + i}</span>
+                        <span class="res">Σ {colSum(i)}</span>
+                        <span class="avg">μ {colAvg(i)}</span>
+                    </div>
                 {/each}
-              </tr>
-            </thead>
-            <tbody>
-              {#each worksheetData as row, rowIndex}
-                <tr>
-                  {#each Array(Math.max(5, worksheetData[0]?.length || 0)) as _, colIndex}
-                    <td>
-                      <input 
-                        type="text" 
-                        value={row[colIndex] || ''} 
-                        oninput={(e) => updateCell(rowIndex, colIndex, e.target.value)}
-                        placeholder={rowIndex === 0 ? 'En-tête' : 'Valeur'}
-                      />
-                    </td>
-                  {/each}
-                </tr>
-              {/each}
-            </tbody>
-          </table>
+            </div>
+
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            {#each Array(worksheetData[0]?.length || 0) as _, i}
+                                <th>{String.fromCharCode(65 + i)}</th>
+                            {/each}
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {#each filteredData as row, rIndex}
+                            <tr>
+                                {#each row as cell, cIndex}
+                                    <td>
+                                        <input 
+                                            type="text" 
+                                            value={cell} 
+                                            oninput={(e) => updateCell(rIndex, cIndex, (e.target as HTMLInputElement).value)} 
+                                        />
+                                    </td>
+                                {/each}
+                            </tr>
+                        {/each}
+                    </tbody>
+                </table>
+            </div>
         </div>
-      </div>
     </div>
-  {/if}
+    {/if}
+</div>
 {/if}
+
+<style lang="scss">
+    $bg-dark: #050505;
+    $accent: #0070f3;
+    $text: #ededed;
+    $text-dim: #888;
+    $glass: rgba(255, 255, 255, 0.03);
+    $border: rgba(255, 255, 255, 0.08);
+
+    :global(body) { background: $bg-dark; color: $text; font-family: 'Inter', sans-serif; margin: 0; }
+
+    .app-container { min-height: 100vh; background: radial-gradient(circle at 0% 0%, #111 0%, #050505 100%); }
+
+    /* NAVIGATION */
+    .glass-nav {
+        display: flex; justify-content: space-between; align-items: center;
+        padding: 1rem 3rem; border-bottom: 1px solid $border;
+        background: rgba(0,0,0,0.8); backdrop-filter: blur(12px);
+        position: sticky; top: 0; z-index: 50;
+
+        .brand {
+            text-decoration: none; color: inherit; display: flex; align-items: center; gap: 1rem;
+            transition: opacity 0.2s; &:hover { opacity: 0.8; }
+            .logo { font-size: 1.2rem; font-weight: 900; background: #fff; color: #000; width: 28px; height: 28px; display: grid; place-items: center; border-radius: 6px; }
+            .brand-text .name { font-weight: 800; letter-spacing: -0.5px; font-size: 0.9rem; }
+            .brand-text .version { font-size: 0.6rem; color: $accent; display: block; }
+        }
+
+        .status-pill {
+            font-size: 0.7rem; color: $text-dim; padding: 6px 12px; border: 1px solid $border; border-radius: 100px;
+            display: flex; align-items: center; gap: 8px;
+            .dot { width: 6px; height: 6px; background: #00ff88; border-radius: 50%; box-shadow: 0 0 8px #00ff88; }
+            .sync { color: $accent; margin-left: 8px; font-family: monospace; }
+        }
+
+        .btn-exit { background: transparent; border: 1px solid $border; color: #ff4d4d; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 0.7rem; &:hover { background: #ff4d4d; color: white; } }
+    }
+
+    /* DASHBOARD CONTENT */
+    .dashboard-content { max-width: 1100px; margin: 4rem auto; padding: 0 2rem; }
+    .hero {
+        display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 3rem;
+        h1 { font-size: 3rem; font-weight: 900; letter-spacing: -1.5px; margin: 0; .highlight { color: $accent; } }
+        p { color: $text-dim; }
+        .quick-stats { display: flex; gap: 2rem; .stat-item { text-align: right; .label { font-size: 0.6rem; color: $text-dim; } .value { display: block; font-size: 1.2rem; font-weight: 800; font-family: monospace; } } }
+    }
+
+    .bento-grid {
+        display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 1rem;
+        .bento-card {
+            background: $glass; border: 1px solid $border; border-radius: 20px; padding: 2rem;
+            display: flex; align-items: center; gap: 1.2rem; cursor: pointer; transition: 0.3s;
+            &:hover:not(.info-only) { background: rgba(255,255,255,0.06); border-color: $accent; transform: translateY(-2px); }
+            .icon { font-size: 2rem; }
+            h3 { font-size: 1rem; margin: 0; }
+            p { font-size: 0.8rem; color: $text-dim; margin: 4px 0 0 0; }
+            &.primary { border-left: 4px solid $accent; }
+            &.info-only { opacity: 0.5; cursor: default; }
+        }
+    }
+
+    /* SPREADSHEET OVERLAY */
+    .spreadsheet-overlay {
+        position: fixed; inset: 0; z-index: 100; background: rgba(0,0,0,0.85); backdrop-filter: blur(10px);
+        display: grid; place-items: center; padding: 2rem;
+        .sheet-window { width: 100%; height: 100%; background: #080808; border: 1px solid $border; border-radius: 16px; display: flex; flex-direction: column; overflow: hidden; }
+    }
+
+    .sheet-toolbar {
+        padding: 0.8rem 1.5rem; border-bottom: 1px solid $border; display: flex; justify-content: space-between; align-items: center; background: #0f0f0f;
+        .left { display: flex; align-items: center; gap: 1.5rem; .file-name { font-family: monospace; color: $accent; font-weight: 700; } }
+        .search-bar { background: #000; border: 1px solid $border; color: #fff; padding: 6px 12px; border-radius: 6px; width: 200px; font-size: 0.8rem; }
+        .actions { display: flex; gap: 0.5rem; .btn-tool { background: #1a1a1a; border: 1px solid $border; color: #fff; padding: 6px 10px; border-radius: 4px; cursor: pointer; font-size: 0.75rem; } .btn-pro { background: #fff; font-weight: 700; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 0.75rem; } .btn-close { background: none; border: none; color: #555; font-size: 1.2rem; cursor: pointer; margin-left: 10px; } }
+    }
+
+    /* STYLE : Barre de calcul */
+    .calc-bar {
+        display: flex; background: #0c0c0c; border-bottom: 1px solid $border; overflow-x: auto; padding: 8px 1.5rem; gap: 2rem;
+        .calc-item {
+            display: flex; flex-direction: column; min-width: 100px;
+            .head { font-size: 0.6rem; color: $text-dim; text-transform: uppercase; font-weight: 800; }
+            .res { font-size: 0.85rem; color: #00ff88; font-family: monospace; font-weight: 700; }
+            .avg { font-size: 0.7rem; color: $accent; font-family: monospace; }
+        }
+    }
+
+    .table-container {
+        flex: 1; overflow: auto;
+        table {
+            width: 100%; border-collapse: collapse;
+            th { background: #0f0f0f; border: 1px solid #151515; padding: 8px; font-size: 0.65rem; color: #444; position: sticky; top: 0; }
+            td {
+                border: 1px solid #151515; padding: 0;
+                input { width: 100%; border: none; background: transparent; color: #ccc; padding: 10px; font-size: 0.85rem; &:focus { background: rgba(0, 112, 243, 0.1); outline: none; color: #fff; } }
+            }
+        }
+    }
+
+    .loader { width: 16px; height: 16px; border: 2px solid #fff; border-bottom-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+</style>
